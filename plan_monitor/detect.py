@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import collections
+import operator
 import datetime
 import logging
 import socket
@@ -16,60 +17,56 @@ from . import config, message_schemas, common
 
 logger = logging.getLogger('plan_monitor.detect')
 
+def filterFunction(plan_stats, stats_time):
+    plan_age_seconds = (stats_time - plan_stats['creation_time']) / 1000
+    last_exec_age_seconds = (stats_time - plan_stats['last_execution_time']) / 1000
+    if plan_stats['execution_count'] <= 1:
+        return False
+    if plan_age_seconds < config.MIN_NEW_PLAN_AGE_SECONDS:
+        return False
+    if plan_age_seconds > config.MAX_NEW_PLAN_AGE_SECONDS or \
+            last_exec_age_seconds > config.MAX_AGE_OF_LAST_EXECUTION_SECONDS:
+        return False
+    if plan_stats['total_elapsed_time'] < config.MIN_TOTAL_ELAPSED_TIME_SECONDS * 1_000_000 \
+            and plan_stats['total_logical_reads'] < config.MIN_TOTAL_LOGICAL_READS:
+        return False
+    if plan_stats['execution_count'] < config.MIN_EXECUTION_COUNT \
+            and plan_age_seconds < config.MIN_AGE_IN_LIEU_OF_EXEC_COUNT_SECONDS:
+        return False
+    if plan_stats['total_logical_writes'] and plan_stats['statement_count'] == 1:
+        return False
+    return True
+
+def isBaselinePlan(plan_stats, stats_time):
+    plan_age_seconds = (stats_time - plan_stats['creation_time']) / 1000
+    last_exec_age_seconds = (stats_time - plan_stats['last_execution_time']) / 1000
+    if plan_stats['execution_count'] <= 1:
+        return False
+    if plan_age_seconds < config.MIN_NEW_PLAN_AGE_SECONDS:
+        return False
+    if plan_age_seconds > config.MAX_NEW_PLAN_AGE_SECONDS or \
+        last_exec_age_seconds > config.MAX_AGE_OF_LAST_EXECUTION_SECONDS and \
+            plan_stats['worst_statement_query_plan_hash'] not in candidate_bad_plans:
+        return True
 
 def find_bad_plans(plans: Dict[str, Dict], stats_time: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     prior_times, prior_reads, prior_execs, prior_plans_count, prior_last_execution = 0, 0, 0, 0, 0
-    prior_plans, candidate_bad_plans, bad_plans = [], [], []
+    prior_plans, bad_plans = [], []
     prior_worst_plan_hashes = set()
 
-    def filterFunction(plan_stats):
-        plan_age_seconds = (stats_time - plan_stats['creation_time']) / 1000
-        last_exec_age_seconds = (stats_time - plan_stats['last_execution_time']) / 1000
-        if plan_stats['execution_count'] <= 1:
-            return False
-        if plan_age_seconds < config.MIN_NEW_PLAN_AGE_SECONDS:
-            return False
-        if plan_age_seconds > config.MAX_NEW_PLAN_AGE_SECONDS or \
-                last_exec_age_seconds > config.MAX_AGE_OF_LAST_EXECUTION_SECONDS:
-            return False
-        if plan_stats['total_elapsed_time'] < config.MIN_TOTAL_ELAPSED_TIME_SECONDS * 1_000_000 \
-                and plan_stats['total_logical_reads'] < config.MIN_TOTAL_LOGICAL_READS:
-            return False
-        if plan_stats['execution_count'] < config.MIN_EXECUTION_COUNT \
-                and plan_age_seconds < config.MIN_AGE_IN_LIEU_OF_EXEC_COUNT_SECONDS:
-            return False
-        if plan_stats['total_logical_writes'] and plan_stats['statement_count'] == 1:
-            return False
-        return True
-
-
     plans_stats = plans.values()
-    candidate_bad_plans = filter(filterFunction, plans_stats)
-    def isBaselinePlan(plan_stats):
-        plan_age_seconds = (stats_time - plan_stats['creation_time']) / 1000
-        last_exec_age_seconds = (stats_time - plan_stats['last_execution_time']) / 1000
-        if plan_stats['execution_count'] <= 1:
-            return False
-        if plan_age_seconds < config.MIN_NEW_PLAN_AGE_SECONDS:
-            return False
-        if plan_age_seconds > config.MAX_NEW_PLAN_AGE_SECONDS or \
-            last_exec_age_seconds > config.MAX_AGE_OF_LAST_EXECUTION_SECONDS and \
-                plan_stats['worst_statement_query_plan_hash'] not in candidate_bad_plans:
-            return True
-    baseline_plans = filter(isBaselinePlan, plans_stats)
+    candidate_bad_plans = filter(lambda x: filterFunction(x, stats_time), plans_stats)
+
+    baseline_plans = filter(lambda x: isBaselinePlan(x, stats_time), plans_stats)
+    prior_plans_count = sum(1 for _ in baseline_plans)
 
     for plan_stats in baseline_plans:
-        prior_plans.append(plan_stats)
-        prior_plans_count += 1
         prior_times += plan_stats['total_elapsed_time']
         prior_reads += plan_stats['total_logical_reads']
         prior_execs += plan_stats['execution_count']
         prior_worst_plan_hashes.add(plan_stats['worst_statement_query_plan_hash'])
         prior_last_execution = max(prior_last_execution, plan_stats['last_execution_time'])
 
-
-    #prior_reads = sum(map(lambda x: x['total_elapsed_time'], baseline_plans))
-    #metricsRes = reduce(metricsReducer, baseline_plans, init_value)
 
     '''for plan_stats in plans.values():
         # shouldn't happen bc of the filter in the STATS_DMVS_QUERY SQL query, just being cautious:

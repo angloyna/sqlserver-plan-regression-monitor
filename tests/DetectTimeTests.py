@@ -122,7 +122,7 @@ def generate_plan_payload(numberToCreate, stats_time):
         }
     return plans
     
-plans = generate_plan_payload(80, stats_time)'''
+plans = generate_plan_payload(800, stats_time)'''
         find_bad_plans(plans, 3232352)
         timed_stuff = timeit.timeit(setup=setup, stmt='find_bad_plans(plans, stats_time)', number=1000)
         print(timed_stuff)
