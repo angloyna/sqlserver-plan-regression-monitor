@@ -5,8 +5,8 @@ import logging
 import socket
 import time
 from datetime import datetime, timedelta, timezone
-from functools import partial
-from typing import Dict, List, Any, Tuple, Set
+from functools import partial, reduce
+from typing import Dict, List, Any, Tuple
 
 import confluent_kafka
 import confluent_kafka.schema_registry.avro
@@ -16,53 +16,82 @@ from . import config, message_schemas, common
 
 logger = logging.getLogger('plan_monitor.detect')
 
-def calculate_plan_age_stats(plan_stats: Dict[str, Any], stats_time: int) -> Tuple[int, int]:
-    plan_age_seconds = (stats_time - plan_stats['creation_time']) / 1000
-    last_exec_age_seconds = (stats_time - plan_stats['last_execution_time']) / 1000
-    return (plan_age_seconds, last_exec_age_seconds)
-
-def is_established_plan(plan_age_seconds: int, last_exec_age_seconds: int) -> bool:
-    return plan_age_seconds > config.MAX_NEW_PLAN_AGE_SECONDS or \
-        last_exec_age_seconds > config.MAX_AGE_OF_LAST_EXECUTION_SECONDS
-
-def is_plan_under_investigation(plan_stats: Dict[str, Any], stats_time: int) -> bool:
-    plan_age_seconds, last_exec_age_seconds = calculate_plan_age_stats(plan_stats, stats_time)
-    return not is_established_plan(plan_age_seconds, last_exec_age_seconds)
-
-# assess which query plan hashes are recent enough to warrant investigation into badness
-# so we can prevent older plans with the same query plan hash from potentially ballooning
-# metrics used for determining badness
-def get_query_plan_hashes_under_investigation(plans: Dict[str, Dict], stats_time: int) -> Set[str]:
-    return {plan_stats['worst_statement_query_plan_hash'] for plan_handle, plan_stats in plans.items() \
-        if is_plan_under_investigation(plan_stats, stats_time)}
 
 def find_bad_plans(plans: Dict[str, Dict], stats_time: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     prior_times, prior_reads, prior_execs, prior_plans_count, prior_last_execution = 0, 0, 0, 0, 0
     prior_plans, candidate_bad_plans, bad_plans = [], [], []
     prior_worst_plan_hashes = set()
-    potential_bad_query_plan_hashes = get_query_plan_hashes_under_investigation(plans, stats_time)
 
-    for plan_handle, plan_stats in plans.items():
+    def filterFunction(plan_stats):
+        plan_age_seconds = (stats_time - plan_stats['creation_time']) / 1000
+        last_exec_age_seconds = (stats_time - plan_stats['last_execution_time']) / 1000
+        if plan_stats['execution_count'] <= 1:
+            return False
+        if plan_age_seconds < config.MIN_NEW_PLAN_AGE_SECONDS:
+            return False
+        if plan_age_seconds > config.MAX_NEW_PLAN_AGE_SECONDS or \
+                last_exec_age_seconds > config.MAX_AGE_OF_LAST_EXECUTION_SECONDS:
+            return False
+        if plan_stats['total_elapsed_time'] < config.MIN_TOTAL_ELAPSED_TIME_SECONDS * 1_000_000 \
+                and plan_stats['total_logical_reads'] < config.MIN_TOTAL_LOGICAL_READS:
+            return False
+        if plan_stats['execution_count'] < config.MIN_EXECUTION_COUNT \
+                and plan_age_seconds < config.MIN_AGE_IN_LIEU_OF_EXEC_COUNT_SECONDS:
+            return False
+        if plan_stats['total_logical_writes'] and plan_stats['statement_count'] == 1:
+            return False
+        return True
+
+
+    plans_stats = plans.values()
+    candidate_bad_plans = filter(filterFunction, plans_stats)
+    def isBaselinePlan(plan_stats):
+        plan_age_seconds = (stats_time - plan_stats['creation_time']) / 1000
+        last_exec_age_seconds = (stats_time - plan_stats['last_execution_time']) / 1000
+        if plan_stats['execution_count'] <= 1:
+            return False
+        if plan_age_seconds < config.MIN_NEW_PLAN_AGE_SECONDS:
+            return False
+        if plan_age_seconds > config.MAX_NEW_PLAN_AGE_SECONDS or \
+            last_exec_age_seconds > config.MAX_AGE_OF_LAST_EXECUTION_SECONDS and \
+                plan_stats['worst_statement_query_plan_hash'] not in candidate_bad_plans:
+            return True
+    baseline_plans = filter(isBaselinePlan, plans_stats)
+
+    for plan_stats in baseline_plans:
+        prior_plans.append(plan_stats)
+        prior_plans_count += 1
+        prior_times += plan_stats['total_elapsed_time']
+        prior_reads += plan_stats['total_logical_reads']
+        prior_execs += plan_stats['execution_count']
+        prior_worst_plan_hashes.add(plan_stats['worst_statement_query_plan_hash'])
+        prior_last_execution = max(prior_last_execution, plan_stats['last_execution_time'])
+
+
+    #prior_reads = sum(map(lambda x: x['total_elapsed_time'], baseline_plans))
+    #metricsRes = reduce(metricsReducer, baseline_plans, init_value)
+
+    '''for plan_stats in plans.values():
         # shouldn't happen bc of the filter in the STATS_DMVS_QUERY SQL query, just being cautious:
         if plan_stats['execution_count'] <= 1:
             continue
-        
-        plan_age_seconds, last_exec_age_seconds = calculate_plan_age_stats(plan_stats, stats_time)
-        current_query_plan_hash = plan_stats['worst_statement_query_plan_hash']
+
+        plan_age_seconds = (stats_time - plan_stats['creation_time']) / 1000
+        last_exec_age_seconds = (stats_time - plan_stats['last_execution_time']) / 1000
 
         if plan_age_seconds < config.MIN_NEW_PLAN_AGE_SECONDS:
             # too new; ignore entirely for now. If it's a problem we'll catch it on next poll
             continue
-        elif is_established_plan(plan_age_seconds, last_exec_age_seconds):
+        elif plan_age_seconds > config.MAX_NEW_PLAN_AGE_SECONDS or \
+                last_exec_age_seconds > config.MAX_AGE_OF_LAST_EXECUTION_SECONDS:
             # this is an old or "established" plan; gather its stats but don't consider it for "badness"
             prior_plans.append(plan_stats)
-            if current_query_plan_hash not in potential_bad_query_plan_hashes:
-                prior_plans_count += 1
-                prior_times += plan_stats['total_elapsed_time']
-                prior_reads += plan_stats['total_logical_reads']
-                prior_execs += plan_stats['execution_count']
-                prior_worst_plan_hashes.add(current_query_plan_hash)
-                prior_last_execution = max(prior_last_execution, plan_stats['last_execution_time'])
+            prior_plans_count += 1
+            prior_times += plan_stats['total_elapsed_time']
+            prior_reads += plan_stats['total_logical_reads']
+            prior_execs += plan_stats['execution_count']
+            prior_worst_plan_hashes.add(plan_stats['worst_statement_query_plan_hash'])
+            prior_last_execution = max(prior_last_execution, plan_stats['last_execution_time'])
             continue
         elif plan_stats['total_elapsed_time'] < config.MIN_TOTAL_ELAPSED_TIME_SECONDS * 1_000_000 \
                 and plan_stats['total_logical_reads'] < config.MIN_TOTAL_LOGICAL_READS:
@@ -76,7 +105,7 @@ def find_bad_plans(plans: Dict[str, Dict], stats_time: int) -> Tuple[List[Dict[s
             # not gonna flush single statements that do writes
             continue
         else:
-            candidate_bad_plans.append(plan_stats)
+            candidate_bad_plans.append(plan_stats)'''
 
     # need enough executions prior plans to be able to trust them as a point of comparison
     if prior_plans_count and candidate_bad_plans and prior_execs > config.MIN_EXECUTION_COUNT:
